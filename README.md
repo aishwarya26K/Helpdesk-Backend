@@ -16,7 +16,7 @@ Companion frontend repo: https://github.com/aishwarya26K/Helpdesk-Frontend
 |---|---|---|
 | v1 | Basic Q&A | ✅ |
 | v2 | Conversation memory | ✅ |
-| v3 | Streaming + persona | ⬜ not started |
+| v3 | Streaming + persona | ✅ |
 | v4 | Token & cost tracking | ⬜ not started |
 | v5 | Structured output | ⬜ not started |
 | v6 | Auth & per-user history | ⬜ not started |
@@ -35,8 +35,13 @@ uvicorn app:app --reload
 
 ## API
 
-- `POST /ask` — `{ "text": string }` → `{ "answer": string }`
+- `POST /ask` — `{ "text": string }` → `text/plain` streamed response (not JSON)
   Appends to a server-side conversation history and includes the full
   history in each call to the model, so follow-up questions retain context.
+  As of v3, the reply streams token-by-token via `StreamingResponse`
+  (`stream=True` on the OpenAI call), and the full accumulated reply is
+  appended to history only after the stream completes. The system prompt
+  gives the assistant a NoonBazaar support persona (warm, concise,
+  ≤3 sentences, never invents order details).
 - `POST /reset` — no body → `{ "status": "reset" }`
   Clears conversation history back to just the system prompt.
