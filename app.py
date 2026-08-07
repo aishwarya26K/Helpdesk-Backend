@@ -6,6 +6,10 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from openai import OpenAI
 import tiktoken
+import json
+from typing import Literal, Optional
+from pydantic import ValidationError
+from fastapi import HTTPException
 
 load_dotenv()
 
@@ -40,8 +44,15 @@ def trim_history(history):
     while rest and count_tokens(rest) > MAX_HISTORY_TOKENS:
         rest.pop(0)
     return [system] + rest
+
 class Question(BaseModel):
     text:str
+
+class Ticket(BaseModel):
+    category: Literal["order", "refund", "technical", "account", "other"]
+    urgency: Literal["low", "medium", "high"]
+    summary: str
+    order_id: Optional[str] = None
 
 @app.post("/ask")
 async def ask(q: Question):
@@ -76,6 +87,36 @@ async def ask(q: Question):
         history.append({"role": "assistant", "content": full_reply})
 
     return StreamingResponse(generate(), media_type="text/plain")
+
+@app.post("/ticket")
+def create_ticket():
+    ticket_instruction = {
+        "role":"user",
+        "content":(
+            "Based only on the conversation so far, produce a support ticket as JSON "
+            "with exactly these keys: category (one of order, refund, technical, account, "
+            "other), urgency (one of low, medium, high), summary (one sentence), and "
+            "order_id (the order id if the customer mentioned one, otherwise null). "
+            "Do not invent an order_id that was never mentioned."
+        )
+    }
+
+    resp = client.chat.completions.create(
+            model="gpt-5.4-mini",
+            messages=history + [ticket_instruction],
+            response_format={"type": "json_object"}
+    )
+
+    raw = resp.choices[0].message.content
+
+    try:
+        parsed = json.loads(raw)
+        ticket = Ticket(**parsed)
+    except (json.JSONDecodeError, ValidationError) as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    return ticket
+
+
 
 @app.post("/reset")
 def reset():
