@@ -1,15 +1,16 @@
 import os
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from openai import OpenAI
 import tiktoken
 import json
 from typing import Literal, Optional
-from pydantic import ValidationError
-from fastapi import HTTPException
+
+# module import
+from auth import get_user_id, sb
 
 load_dotenv()
 
@@ -23,11 +24,11 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
-history = [{"role": "system", "content": (
+SYSTEM_PROMPT = {"role": "system", "content": (
     "You are HelpDesk, the support assistant for NoonBazaar, a Dubai online store. "
     "Be warm, concise, and professional. Answer in at most 3 sentences. "
     "If you don't know, say so and offer to raise a ticket. Never invent order details."
-)}]
+)}
 
 IN_PRICE  = 0.15             # $ per 1M input/prompt tokens — check OpenAI's actual pricing for gpt-5.4-mini
 OUT_PRICE = 0.60              # $ per 1M output/completion tokens
@@ -45,6 +46,20 @@ def trim_history(history):
         rest.pop(0)
     return [system] + rest
 
+def load_history(user_id: str):
+    rows = (sb.table("messages").select("role, content")
+              .eq("user_id", user_id).order("created_at")
+              .execute().data)
+    history = [SYSTEM_PROMPT] + [{"role": r["role"], "content": r["content"]} for r in rows]
+    return trim_history(history)
+
+def save_message(user_id: str, role: str, content: str):
+    sb.table("messages").insert({
+        "user_id": user_id,
+        "role": role,
+        "content": content
+    }).execute()
+
 class Question(BaseModel):
     text:str
 
@@ -55,9 +70,9 @@ class Ticket(BaseModel):
     order_id: Optional[str] = None
 
 @app.post("/ask")
-async def ask(q: Question):
-    history.append({"role":"user", "content":q.text})
-    history[:] = trim_history(history)
+async def ask(q: Question, user_id: str = Depends(get_user_id)):
+    save_message(user_id, "user", q.text)
+    history = load_history(user_id)
 
     def generate():
         global session_cost
@@ -84,12 +99,13 @@ async def ask(q: Question):
                 )
                 yield footer
 
-        history.append({"role": "assistant", "content": full_reply})
+        save_message(user_id, "assistant", full_reply)
 
     return StreamingResponse(generate(), media_type="text/plain")
 
 @app.post("/ticket")
-def create_ticket():
+def create_ticket(user_id: str = Depends(get_user_id)):
+    history = load_history(user_id)
     ticket_instruction = {
         "role":"user",
         "content":(
@@ -119,13 +135,9 @@ def create_ticket():
 
 
 @app.post("/reset")
-def reset():
-    global history, session_cost
-    history = [{"role": "system", "content": (
-        "You are HelpDesk, the support assistant for NoonBazaar, a Dubai online store. "
-        "Be warm, concise, and professional. Answer in at most 3 sentences. "
-        "If you don't know, say so and offer to raise a ticket. Never invent order details."
-    )}]
+def reset(user_id: str = Depends(get_user_id)):
+    global session_cost
+    sb.table("messages").delete().eq("user_id", user_id).execute()
     session_cost = 0.0
     return {"status": "reset"}
 

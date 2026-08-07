@@ -19,7 +19,7 @@ Companion frontend repo: https://github.com/aishwarya26K/Helpdesk-Frontend
 | v3 | Streaming + persona | ✅ |
 | v4 | Token & cost tracking | ✅ |
 | v5 | Structured JSON tickets (JSON mode + schema validation) | ✅ |
-| v6 | Auth & per-user history | ⬜ not started |
+| v6 | Supabase Auth + per-user history in Postgres | ✅ |
 | v7 | Redis & concurrency | ⬜ not started |
 | v8 | Production deployment | ⬜ not started |
 
@@ -29,23 +29,27 @@ Companion frontend repo: https://github.com/aishwarya26K/Helpdesk-Frontend
 python -m venv venv
 venv\Scripts\Activate.ps1   # Windows PowerShell
 pip install -r requirements.txt
-# create .env with OPENAI_API_KEY=...
+# create .env with OPENAI_API_KEY=..., SUPABASE_URL=..., SUPABASE_SERVICE_KEY=...
 uvicorn app:app --reload
 ```
 
 ## API
 
+As of v6, every route below requires an `Authorization: Bearer <jwt>`
+header — a valid Supabase Auth access token. Requests without one (or
+with an invalid/expired one) get a `401` before the route body runs.
+
 - `POST /ask` — `{ "text": string }` → `text/plain` streamed response (not JSON)
-  Appends to a server-side conversation history and includes the full
-  history in each call to the model, so follow-up questions retain context.
-  As of v3, the reply streams token-by-token via `StreamingResponse`
-  (`stream=True` on the OpenAI call), and the full accumulated reply is
-  appended to history only after the stream completes. The system prompt
-  gives the assistant a NoonBazaar support persona (warm, concise,
-  ≤3 sentences, never invents order details).
+  Loads the authenticated user's conversation history from Postgres,
+  includes it in the call to the model so follow-up questions retain
+  context, and saves both the question and the full reply back to
+  Postgres once the stream completes. The reply still streams
+  token-by-token via `StreamingResponse` (`stream=True`). The system
+  prompt gives the assistant a NoonBazaar support persona (warm,
+  concise, ≤3 sentences, never invents order details).
 - `POST /reset` — no body → `{ "status": "reset" }`
-  Clears conversation history back to just the system prompt (and the
-  running session cost).
+  Deletes the authenticated user's rows from the `messages` table
+  (and resets the running session cost).
 
 As of v4, every `/ask` reply ends with a footer line —
 `[N tokens · $cost · session: $total]` — appended to the same text
@@ -63,7 +67,10 @@ stream, so no frontend changes were needed to display it.
   `ValidationError` are caught and turned into a `422` with the
   validation detail in the response body, instead of a raw 500.
   `order_id` is `Optional[str]`, and the prompt explicitly instructs
-  the model not to invent one that was never mentioned.
+  the model not to invent one that was never mentioned. Also requires
+  auth as of v6, and loads that user's history the same way `/ask`
+  does. The generated ticket itself is returned in the response but
+  not persisted anywhere — no `tickets` table exists yet.
 
 ## Cost tracking — pricing assumptions
 
@@ -119,3 +126,54 @@ The direct test above is the authoritative proof that the validation
 layer itself works; the endpoint's `try/except` around
 `json.JSONDecodeError` and `ValidationError` is the same code path
 that would fire if it ever did.
+
+## v6 — Supabase Auth + per-user history in Postgres
+
+The shared in-memory `history` list from v1–v5 is gone. Conversation
+history now lives in a `messages` table in Postgres (Supabase),
+scoped per user:
+
+```sql
+create table messages (
+  id          bigint generated always as identity primary key,
+  user_id     uuid not null references auth.users(id),
+  role        text not null,
+  content     text not null,
+  created_at  timestamptz default now()
+);
+create index on messages (user_id, created_at);
+alter table messages enable row level security;
+create policy "own messages" on messages
+  for all using (auth.uid() = user_id);
+```
+
+`auth.py` verifies the `Authorization: Bearer <jwt>` header on every
+request via `sb.auth.get_user(token)` — the `user_id` is always
+derived from the verified token server-side, never trusted from the
+client. `app.py` uses `Depends(get_user_id)` on `/ask`, `/ticket`,
+and `/reset` so an invalid/missing token is rejected before any route
+logic runs. `load_history()` / `save_message()` replace the old list
+with Postgres reads/writes, and v4's `trim_history()` token-budget
+logic still runs on the loaded rows.
+
+The backend connects with the `service_role` key (bypasses RLS,
+backend-only, never exposed to the frontend) — RLS is still enabled
+on the table as a defense-in-depth backstop in case application code
+ever has a bug, verified directly:
+
+```sql
+set role anon;
+select * from messages;
+-- returns zero rows: no session, so auth.uid() matches nothing
+```
+
+**Verified:**
+- Two accounts, two histories — separate `user_id`s in the table,
+  confirmed no cross-contamination between accounts, both via direct
+  `curl` requests and the frontend UI (after fixing a frontend bug
+  where local chat state wasn't cleared on account switch)
+- Durability — restarted `uvicorn` mid-conversation, history was
+  still there on the next request, proving it's read from Postgres
+  and not held in the Python process's memory
+- RLS — confirmed the `anon` role cannot read any rows without a
+  valid session, independent of the FastAPI app's own checks
