@@ -17,16 +17,27 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
+history = [{"role": "system", "content": "You are HelpDesk, a helpful support assistant."}]
+
 class Question(BaseModel):
     text:str
 
 @app.post("/ask")
 def ask(q: Question):
+    history.append({"role":"user", "content":q.text})
     resp = client.chat.completions.create(
         model="gpt-5.4-mini",
-        messages=[{"role":"user", "content":q.text}]
+        messages=history
     )
-    return {"answer":resp.choices[0].message.content}
+    reply = resp.choices[0].message.content
+    history.append({"role": "assistant", "content": reply})
+    return {"answer":reply}
+
+@app.post("/reset")
+def reset():
+    global history
+    history = [{"role": "system", "content": "You are HelpDesk, a helpful support assistant."}]
+    return {"status": "reset"}
 
 # uvicorn app:app --reload
 # cd frontend\helpdesk-ui> npm run dev

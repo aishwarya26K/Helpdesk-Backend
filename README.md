@@ -5,7 +5,7 @@ customer-support chatbot for a fictional Dubai e-commerce company, built
 incrementally from basic Q&A through memory, streaming, cost tracking,
 structured output, auth, caching, and production deployment.
 
-Companion frontend repo: (link to helpdesk-frontend once created)
+Companion frontend repo: https://github.com/aishwarya26K/Helpdesk-Frontend
 
 ## Tech Stack
 - FastAPI + Python (:8000)
@@ -15,7 +15,7 @@ Companion frontend repo: (link to helpdesk-frontend once created)
 | Version | Feature | Status |
 |---|---|---|
 | v1 | Basic Q&A | ✅ |
-| v2 | Conversation memory | ⬜ not started |
+| v2 | Conversation memory | ✅ |
 | v3 | Streaming + persona | ⬜ not started |
 | v4 | Token & cost tracking | ⬜ not started |
 | v5 | Structured output | ⬜ not started |
@@ -36,3 +36,7 @@ uvicorn app:app --reload
 ## API
 
 - `POST /ask` — `{ "text": string }` → `{ "answer": string }`
+  Appends to a server-side conversation history and includes the full
+  history in each call to the model, so follow-up questions retain context.
+- `POST /reset` — no body → `{ "status": "reset" }`
+  Clears conversation history back to just the system prompt.
