@@ -10,6 +10,7 @@ Companion frontend repo: https://github.com/aishwarya26K/Helpdesk-Frontend
 ## Tech Stack
 - FastAPI + Python (:8000)
 - OpenAI API
+- Redis (cache-aside + per-user locks)
 
 ## Progress
 | Version | Feature | Status |
@@ -20,7 +21,7 @@ Companion frontend repo: https://github.com/aishwarya26K/Helpdesk-Frontend
 | v4 | Token & cost tracking | ✅ |
 | v5 | Structured JSON tickets (JSON mode + schema validation) | ✅ |
 | v6 | Supabase Auth + per-user history in Postgres | ✅ |
-| v7 | Redis & concurrency | ⬜ not started |
+| v7 | Redis & concurrency | ✅ |
 | v8 | Production deployment | ⬜ not started |
 
 ## Running locally
@@ -29,7 +30,9 @@ Companion frontend repo: https://github.com/aishwarya26K/Helpdesk-Frontend
 python -m venv venv
 venv\Scripts\Activate.ps1   # Windows PowerShell
 pip install -r requirements.txt
-# create .env with OPENAI_API_KEY=..., SUPABASE_URL=..., SUPABASE_SERVICE_KEY=...
+# create .env with OPENAI_API_KEY=..., SUPABASE_URL=..., SUPABASE_SERVICE_KEY=...,
+#   and (v7) REDIS_URL=redis://localhost:6379
+brew services start redis    # macOS; must be reachable (redis-cli ping -> PONG)
 uvicorn app:app --reload
 ```
 
@@ -177,3 +180,51 @@ select * from messages;
   and not held in the Python process's memory
 - RLS — confirmed the `anon` role cannot read any rows without a
   valid session, independent of the FastAPI app's own checks
+
+## v7 — Redis cache-aside + per-user locks + non-blocking I/O
+
+A `store.py` data layer now sits in front of Postgres. `app.py`
+routes call it instead of touching the DB directly.
+
+**Cache-aside reads.** `load_history(user_id)` tries Redis first
+(`GET convo:<user_id>`); on a hit it returns the JSON-decoded history
+in sub-milliseconds. On a miss it loads from Postgres (the v6 loader,
+still the source of truth), then `SETEX`es the result with a 30-minute
+TTL (`TTL = 1800`) so the next read is a hit. Idle conversations
+auto-evict when the TTL lapses and simply reload from Postgres on the
+next message — cache stays bounded, no manual cleanup.
+
+**Dual-write.** `append_turn(user_id, role, content)` writes Postgres
+first (durable), then updates the Redis copy and refreshes the TTL, so
+the cache never goes stale behind the DB. `trim_history()` still runs
+on the cached list so it honours the v4 token budget. `/ask` calls
+`append_turn` for both the user turn and the assistant reply; `/reset`
+calls `invalidate(user_id)` (`DEL convo:<user_id>`) after wiping
+Postgres so a cache hit can never resurrect deleted history.
+
+Postgres remains authoritative — verified by `redis-cli FLUSHALL`
+mid-conversation: the next request logged `cache miss`, reloaded from
+Postgres with no data loss, and refilled the cache.
+
+**Per-user lock (concurrency safety).** `with_user_lock(user_id)` does
+`SET lock:<user_id> 1 NX EX 5` — only one caller acquires it; it
+auto-expires after 5s so a dead request can't deadlock. `/ask` checks
+it at entry and returns `429` if a previous message for the same user
+is still in flight, so two rapid messages can't interleave and corrupt
+the cached list. The key is per `user_id`, never global — different
+users never block each other. Verified by firing two concurrent `/ask`
+requests with the same token: one `200`, one `429`.
+
+**Non-blocking I/O.** `/ask` is a plain `def` (not `async def`): the
+OpenAI and Supabase clients are synchronous, so FastAPI runs the
+handler in a threadpool. One user's long (streaming) generation blocks
+only its own worker thread, not the event loop, so other users are
+served concurrently. Declaring it `async def` while calling sync
+clients would have captured the single event-loop thread and
+serialized everyone — the opposite of the goal.
+
+**Auth hardening (found during v7 testing).** `get_user_id` now wraps
+`sb.auth.get_user(token)` in a `try/except` — the Supabase client
+*raises* on an expired/invalid JWT rather than returning an empty
+result, which previously surfaced as a `500`. It now returns a clean
+`401` on any auth failure.
