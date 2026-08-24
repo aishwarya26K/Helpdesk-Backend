@@ -12,7 +12,10 @@ sb = create_client(
 
 def get_user_id(authorization: str = Header(...)) -> str:
     token = authorization.removeprefix("Bearer ").strip()
-    res = sb.auth.get_user(token)
+    try:
+        res = sb.auth.get_user(token)
+    except Exception:
+        raise HTTPException(401, "Invalid or expired token")
     if not res or not res.user:
         raise HTTPException(401, "Invalid or expired token")
     return res.user.id

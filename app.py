@@ -1,13 +1,14 @@
 import os
-from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ValidationError
 from openai import OpenAI
-import tiktoken
 import json
 from typing import Literal, Optional
+
+from dotenv import load_dotenv
+from store import load_history, append_turn, invalidate, with_user_lock
 
 # module import
 from auth import get_user_id, sb
@@ -24,41 +25,9 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
-SYSTEM_PROMPT = {"role": "system", "content": (
-    "You are HelpDesk, the support assistant for NoonBazaar, a Dubai online store. "
-    "Be warm, concise, and professional. Answer in at most 3 sentences. "
-    "If you don't know, say so and offer to raise a ticket. Never invent order details."
-)}
-
 IN_PRICE  = 0.15             # $ per 1M input/prompt tokens — check OpenAI's actual pricing for gpt-5.4-mini
 OUT_PRICE = 0.60              # $ per 1M output/completion tokens
 session_cost = 0.0
-
-enc = tiktoken.get_encoding("o200k_base")
-MAX_HISTORY_TOKENS = 3000
-
-def count_tokens(messages):
-    return sum(len(enc.encode(m["content"])) for m in messages)
-
-def trim_history(history):
-    system, rest = history[0], history[1:]
-    while rest and count_tokens(rest) > MAX_HISTORY_TOKENS:
-        rest.pop(0)
-    return [system] + rest
-
-def load_history(user_id: str):
-    rows = (sb.table("messages").select("role, content")
-              .eq("user_id", user_id).order("created_at")
-              .execute().data)
-    history = [SYSTEM_PROMPT] + [{"role": r["role"], "content": r["content"]} for r in rows]
-    return trim_history(history)
-
-def save_message(user_id: str, role: str, content: str):
-    sb.table("messages").insert({
-        "user_id": user_id,
-        "role": role,
-        "content": content
-    }).execute()
 
 class Question(BaseModel):
     text:str
@@ -70,8 +39,10 @@ class Ticket(BaseModel):
     order_id: Optional[str] = None
 
 @app.post("/ask")
-async def ask(q: Question, user_id: str = Depends(get_user_id)):
-    save_message(user_id, "user", q.text)
+def ask(q: Question, user_id: str = Depends(get_user_id)):
+    if not with_user_lock(user_id):
+        raise HTTPException(429, "Slow down — previous message still processing")
+    append_turn(user_id,"user",q.text)
     history = load_history(user_id)
 
     def generate():
@@ -99,7 +70,7 @@ async def ask(q: Question, user_id: str = Depends(get_user_id)):
                 )
                 yield footer
 
-        save_message(user_id, "assistant", full_reply)
+        append_turn(user_id,"assistant",full_reply)
 
     return StreamingResponse(generate(), media_type="text/plain")
 
@@ -138,6 +109,7 @@ def create_ticket(user_id: str = Depends(get_user_id)):
 def reset(user_id: str = Depends(get_user_id)):
     global session_cost
     sb.table("messages").delete().eq("user_id", user_id).execute()
+    invalidate(user_id)
     session_cost = 0.0
     return {"status": "reset"}
 
