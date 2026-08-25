@@ -5,6 +5,16 @@ from auth import sb  # reuse the Supabase client from v6
 r = redis.from_url(os.environ["REDIS_URL"])
 TTL = 1800  # 30 min
 
+RATE_LIMIT = 20        # max requests
+RATE_WINDOW = 60       # per 60 sec
+
+def rate_limit_ok(user_id: str) -> bool:
+    key = f"rate:{user_id}"
+    n = r.incr(key)
+    if n == 1:
+        r.expire(key, RATE_WINDOW)
+    return n <= RATE_LIMIT
+
 SYSTEM_PROMPT = {"role": "system", "content": (
     "You are HelpDesk, the support assistant for NoonBazaar, a Dubai online store. "
     "Be warm, concise, and professional. Answer in at most 3 sentences. "

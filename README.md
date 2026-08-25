@@ -11,6 +11,8 @@ Companion frontend repo: https://github.com/aishwarya26K/Helpdesk-Frontend
 - FastAPI + Python (:8000)
 - OpenAI API
 - Redis (cache-aside + per-user locks)
+- Docker (containerized for deploy)
+- Deploy: Render (backend container) · Upstash (managed Redis) · Supabase (DB + Auth)
 
 ## Progress
 | Version | Feature | Status |
@@ -22,7 +24,9 @@ Companion frontend repo: https://github.com/aishwarya26K/Helpdesk-Frontend
 | v5 | Structured JSON tickets (JSON mode + schema validation) | ✅ |
 | v6 | Supabase Auth + per-user history in Postgres | ✅ |
 | v7 | Redis & concurrency | ✅ |
-| v8 | Production deployment | ⬜ not started |
+| v8 | Production deployment | 🚧 code ready — Dockerfile, prod CORS, /health, rate limiting |
+
+**Live:** _backend_ `<RENDER_URL>` · _frontend_ `<VERCEL_URL>` — fill in once deployed.
 
 ## Running locally
 
@@ -228,3 +232,71 @@ serialized everyone — the opposite of the goal.
 *raises* on an expired/invalid JWT rather than returning an empty
 result, which previously surfaced as a `500`. It now returns a clean
 `401` on any auth failure.
+
+## v8 — Production deployment
+
+Local dev is gone; the app runs as managed services reachable over the
+public internet.
+
+**Topology.**
+```
+browser → Vercel (Next.js frontend) → HTTPS → Render (FastAPI container)
+                                                   ├── Supabase (Postgres + Auth)
+                                                   └── Upstash (managed Redis, rediss:// TLS)
+```
+
+**Containerized.** A `Dockerfile` (`python:3.12-slim`) packages the
+backend. `requirements.txt` is copied and installed *before* the app
+code so the dependency layer stays cached across code edits. The
+container listens on `0.0.0.0:${PORT:-8000}` — `0.0.0.0` so the host
+can route traffic in, `$PORT` because Render injects its own. A
+`.dockerignore` keeps `venv/`, `.env`, `__pycache__`, and `.git` out of
+the image. Render builds the Dockerfile in its own cloud on every
+`git push`; no local Docker required.
+
+**Secrets via env, never committed.** All secrets
+(`OPENAI_API_KEY`, `SUPABASE_SERVICE_KEY`, `REDIS_URL`, `FRONTEND_URL`)
+live in Render's dashboard and are read with `os.environ[...]`. Only
+`.env.example` (variable *names*, no values) is committed; `.env` stays
+gitignored.
+
+**Production CORS.** `allow_origins` is now
+`[os.environ.get("FRONTEND_URL", "http://localhost:3000")]` — the
+deployed Vercel URL in prod, localhost as the dev fallback. Wrong
+origin = browser blocks every call ("works locally, blocked in prod"),
+so `FRONTEND_URL` must exactly match the Vercel domain.
+
+**Health check.** `GET /health` returns `{"ok": true}` (no auth) so
+Render can poll it and auto-restart a dead container.
+
+**Rate limiting.** `rate_limit_ok(user_id)` in `store.py` uses a Redis
+fixed-window counter — `INCR rate:<user_id>`, `EXPIRE 60s` on first
+hit, reject once over `RATE_LIMIT = 20` per `RATE_WINDOW = 60s`. `/ask`
+returns `429` when exceeded, capping the OpenAI bill against abuse.
+This is *in addition to* the v7 per-user lock (which prevents
+concurrent in-flight messages corrupting the cache) — the two solve
+different problems and both run at the top of `/ask`.
+
+**Managed Redis.** `redis.from_url()` accepts the Upstash `rediss://`
+URL directly; the extra `s` is TLS, handled automatically — no code
+change from the v7 local `redis://`.
+
+### Env vars (production)
+
+| Var | Where | Notes |
+|---|---|---|
+| `OPENAI_API_KEY` | Render | secret |
+| `SUPABASE_URL` | Render | |
+| `SUPABASE_SERVICE_KEY` | Render | secret, backend-only, bypasses RLS |
+| `REDIS_URL` | Render | Upstash `rediss://…` |
+| `FRONTEND_URL` | Render | the Vercel domain, for CORS |
+| `PORT` | Render (auto) | injected by host |
+
+### Deploy steps
+
+1. Push this repo to GitHub.
+2. Render → New → Web Service → connect repo → Render detects the
+   `Dockerfile` and builds it.
+3. Set all env vars above in the Render dashboard.
+4. Deploy; confirm `GET /health` returns `{"ok": true}`.
+5. Set `FRONTEND_URL` to the Vercel URL, redeploy.

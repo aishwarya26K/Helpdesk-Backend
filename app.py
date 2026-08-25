@@ -8,7 +8,7 @@ import json
 from typing import Literal, Optional
 
 from dotenv import load_dotenv
-from store import load_history, append_turn, invalidate, with_user_lock
+from store import load_history, append_turn, invalidate, with_user_lock, rate_limit_ok
 
 # module import
 from auth import get_user_id, sb
@@ -20,7 +20,9 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=[
+    os.environ.get("FRONTEND_URL", "http://localhost:3000"),
+    ],
     allow_methods=["*"],
     allow_headers=["*"]
 )
@@ -42,6 +44,8 @@ class Ticket(BaseModel):
 def ask(q: Question, user_id: str = Depends(get_user_id)):
     if not with_user_lock(user_id):
         raise HTTPException(429, "Slow down — previous message still processing")
+    if not rate_limit_ok(user_id):
+        raise HTTPException(429, "Rate limit exceeded — try again in a minute")
     append_turn(user_id,"user",q.text)
     history = load_history(user_id)
 
@@ -104,7 +108,6 @@ def create_ticket(user_id: str = Depends(get_user_id)):
     return ticket
 
 
-
 @app.post("/reset")
 def reset(user_id: str = Depends(get_user_id)):
     global session_cost
@@ -113,5 +116,6 @@ def reset(user_id: str = Depends(get_user_id)):
     session_cost = 0.0
     return {"status": "reset"}
 
-# uvicorn app:app --reload
-# cd frontend\helpdesk-ui> npm run dev
+@app.get("/health")
+def health():
+    return {"ok": True}
