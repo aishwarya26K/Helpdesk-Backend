@@ -24,9 +24,9 @@ Companion frontend repo: https://github.com/aishwarya26K/Helpdesk-Frontend
 | v5 | Structured JSON tickets (JSON mode + schema validation) | ✅ |
 | v6 | Supabase Auth + per-user history in Postgres | ✅ |
 | v7 | Redis & concurrency | ✅ |
-| v8 | Production deployment | 🚧 code ready — Dockerfile, prod CORS, /health, rate limiting |
+| v8 | Production deployment | ✅ Dockerfile, prod CORS, /health, rate limiting, live on Render + Vercel |
 
-**Live:** _backend_ `<RENDER_URL>` · _frontend_ `<VERCEL_URL>` — fill in once deployed.
+**Live:** _backend_ https://helpdesk-backend-bx4x.onrender.com · _frontend_ https://helpdesk-frontend-rho-six.vercel.app
 
 ## Running locally
 
@@ -35,8 +35,9 @@ python -m venv venv
 venv\Scripts\Activate.ps1   # Windows PowerShell
 pip install -r requirements.txt
 # create .env with OPENAI_API_KEY=..., SUPABASE_URL=..., SUPABASE_SERVICE_KEY=...,
-#   and (v7) REDIS_URL=redis://localhost:6379
-brew services start redis    # macOS; must be reachable (redis-cli ping -> PONG)
+#   and REDIS_URL=... — either a local redis://localhost:6379 (needs a local
+#   Redis running), or the Upstash rediss:// URL (TLS, two s — same as prod)
+brew services start redis    # only if using local redis:// (redis-cli ping -> PONG)
 uvicorn app:app --reload
 ```
 
@@ -57,6 +58,12 @@ with an invalid/expired one) get a `401` before the route body runs.
 - `POST /reset` — no body → `{ "status": "reset" }`
   Deletes the authenticated user's rows from the `messages` table
   (and resets the running session cost).
+- `GET /history` — no body → array of the user's chat turns
+  `[{ role, content }, ...]` (system prompt stripped). Lets the
+  frontend repopulate the conversation on page load so a refresh
+  doesn't lose the visible history (React state alone is wiped on
+  reload; the turns still live in Postgres/Redis per `user_id`).
+- `GET /health` — no auth → `{ "ok": true }`, for Render's health probe.
 
 As of v4, every `/ask` reply ends with a footer line —
 `[N tokens · $cost · session: $total]` — appended to the same text
@@ -89,7 +96,7 @@ estimates — `usage` is the source of truth for real dollar cost.
 history token budget before each request.
 
 Pricing constants (`IN_PRICE`, `OUT_PRICE` in `app.py`), in USD per
-1M tokens for `gpt-5.4-mini`:
+1M tokens for `gpt-4o-mini`:
 
 | | Price per 1M tokens |
 |---|---|
@@ -125,7 +132,7 @@ category
 ```
 
 That `ValidationError` is exactly what `/ticket` catches and turns
-into a `422`. In practice, `gpt-5.4-mini` reliably self-corrects to a
+into a `422`. In practice, `gpt-4o-mini` reliably self-corrects to a
 valid category even when the prompt's enum list is loosened, so
 triggering that same rejection live through the endpoint is hard to
 force — the model's own output rarely strays outside the allowed set.
@@ -278,8 +285,14 @@ concurrent in-flight messages corrupting the cache) — the two solve
 different problems and both run at the top of `/ask`.
 
 **Managed Redis.** `redis.from_url()` accepts the Upstash `rediss://`
-URL directly; the extra `s` is TLS, handled automatically — no code
-change from the v7 local `redis://`.
+URL directly; the extra `s` is TLS. Upstash is **TLS-only** — the URL
+*must* use `rediss://` (two s). A plain `redis://` silently connects
+without TLS and Upstash drops it (`Connection closed by server`), or,
+if the URL is empty/missing, defaults to `localhost:6379`
+(`Connection refused`). Both surface only on the first Redis command
+(lazy connect), not at boot — so a bad `REDIS_URL` passes startup and
+fails on the first `/ask`. Same URL is used locally, so local dev also
+needs `rediss://`.
 
 ### Env vars (production)
 
