@@ -46,18 +46,27 @@ def ask(q: Question, user_id: str = Depends(get_user_id)):
         raise HTTPException(429, "Slow down — previous message still processing")
     if not rate_limit_ok(user_id):
         raise HTTPException(429, "Rate limit exceeded — try again in a minute")
-    append_turn(user_id,"user",q.text)
-    history = load_history(user_id)
+    try:
+        append_turn(user_id,"user",q.text)
+        history = load_history(user_id)
+    except Exception as e:
+        # Redis/Supabase failure — surface with CORS headers, not an opaque 500
+        raise HTTPException(502, f"History store failed: {e}")
 
-    def generate():
-        global session_cost
-        full_reply = ""
+    try:
         stream = client.chat.completions.create(
-            model="gpt-5.4-mini",
+            model="gpt-4o-mini",
             messages=history,
             stream=True,
             stream_options={"include_usage": True}      # ask for a final usage chunk
         )
+    except Exception as e:
+        # surface the real reason with CORS headers instead of an opaque 500
+        raise HTTPException(502, f"LLM call failed: {e}")
+
+    def generate():
+        global session_cost
+        full_reply = ""
         for chunk in stream:
             if chunk.choices and chunk.choices[0].delta.content:
                 delta = chunk.choices[0].delta.content
@@ -93,7 +102,7 @@ def create_ticket(user_id: str = Depends(get_user_id)):
     }
 
     resp = client.chat.completions.create(
-            model="gpt-5.4-mini",
+            model="gpt-4o-mini",
             messages=history + [ticket_instruction],
             response_format={"type": "json_object"}
     )
