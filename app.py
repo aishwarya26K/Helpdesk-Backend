@@ -125,6 +125,11 @@ def reset(user_id: str = Depends(get_user_id)):
     session_cost = 0.0
     return {"status": "reset"}
 
+@app.get("/history")
+def history(user_id: str = Depends(get_user_id)):
+    msgs = load_history(user_id)                       # [system, user, assistant, ...]
+    return [m for m in msgs if m["role"] != "system"]  # drop system prompt, keep chat turns
+
 @app.get("/health")
 def health():
     return {"ok": True}
